@@ -1,7 +1,7 @@
 // Offline support: precaches the whole build on install and serves it cache-first.
 // tool/build_web.sh fills in the version and file list; a new version replaces
 // the old cache and takes effect on the next launch.
-const CACHE = 'two-dozen-78a38e8863c4';
+const CACHE = 'two-dozen-78422d2e9810';
 // Flutter's loader picks the smaller Chromium CanvasKit build when these APIs exist;
 // only cache the variant this browser will use.
 const chromium = typeof Intl.v8BreakIterator !== 'undefined' && typeof ImageDecoder !== 'undefined';
