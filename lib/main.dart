@@ -1,22 +1,15 @@
-import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'dart:math';
 import 'dart:async';
-import 'games.dart';
-import 'settings.dart';
+import 'dart:math';
 
-enum Operation {
-  None,
-  Addition,
-  Subtraction,
-  Multiplication,
-  Division,
-  Reset,
-  Sum,
-  Product,
-  Undo,
-  Redo,
-}
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'engine/frac.dart';
+import 'engine/solver.dart';
+import 'puzzle_service.dart';
+import 'settings.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -24,49 +17,14 @@ void main() async {
   runApp(MyApp(appSettings: AppSettings(prefs)));
 }
 
-(int,int) reduceFrac((int,int) r){
-    int g = r.$2.gcd(r.$1);
-    return (
-      r.$1 ~/ g,
-      r.$2 ~/ g,
-    );
-}
-
-(int,int) addFrac((int,int) a, (int,int) b){
-  return reduceFrac((
-    a.$1*b.$2+b.$1*a.$2,
-    a.$2*b.$2
-  ));
-}
-
-(int,int) subFrac((int,int) a, (int,int) b){
-  return addFrac(a, (-b.$1, b.$2));
-}
-
-(int,int) mulFrac((int,int) a, (int,int) b){
-  return reduceFrac((
-      a.$1 * b.$1,
-      a.$2 * b.$2
-  ));
-}
-
-(int,int) divFrac((int,int) a, (int,int) b){
-  return mulFrac(a, (b.$2, b.$1));
-}
-
-String strFrac((int, int) r){
-  if(r.$2 == 1){
-    return r.$1.toString();
-  }
-  return '${r.$1.toString()}/${r.$2.toString()}';
-}
-
+/// Results larger than this are refused to keep arithmetic exact everywhere.
+const int _maxMagnitude = 1000000000000;
 
 class MyApp extends StatefulWidget {
   final AppSettings appSettings;
-  const MyApp({Key? key, required this.appSettings}) : super(key : key);
+  const MyApp({super.key, required this.appSettings});
   @override
-  _MyAppState createState() => _MyAppState();
+  State<MyApp> createState() => _MyAppState();
 }
 
 class _MyAppState extends State<MyApp> {
@@ -74,7 +32,6 @@ class _MyAppState extends State<MyApp> {
     colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepOrange),
     useMaterial3: true,
   );
-
 
   void _changeTheme(bool darkMode, Color themeColor) {
     Brightness mode = darkMode ? Brightness.dark : Brightness.light;
@@ -88,7 +45,7 @@ class _MyAppState extends State<MyApp> {
   }
 
   @override
-  void initState(){
+  void initState() {
     super.initState();
     Settings s = readSettings(widget.appSettings);
     _changeTheme(s.darkMode, s.themeColor);
@@ -99,235 +56,57 @@ class _MyAppState extends State<MyApp> {
     return MaterialApp(
       title: 'Two Dozen',
       theme: _currentTheme,
-      home: ButtonSquare(appSettings: widget.appSettings, changeTheme: _changeTheme),
+      home: GameScreen(appSettings: widget.appSettings, changeTheme: _changeTheme),
       debugShowCheckedModeBanner: false,
     );
   }
 }
 
-
-class ButtonSquare extends StatefulWidget {
+class GameScreen extends StatefulWidget {
   final AppSettings appSettings;
-  final Function changeTheme;
-  const ButtonSquare({required this.appSettings, required this.changeTheme});
+  final void Function(bool darkMode, Color themeColor) changeTheme;
+  const GameScreen({super.key, required this.appSettings, required this.changeTheme});
   @override
-  _ButtonSquareState createState() => _ButtonSquareState();
+  State<GameScreen> createState() => _GameScreenState();
 }
 
-class _ButtonSquareState extends State<ButtonSquare> {
-  bool isButtonVisible = true; // Initially, buttons are visible
-  List<(int,int)> numbers = [(1,1), (2,1), (3,1), (4,1)];
-  List<(List<(int, int)>, int)> history = [];
-  int history_point = 0;
-  int num_select = -1;
-
-  late Timer timer;
-  int timer_seconds = 0;
-  int num_solves = 0;
-  
-  Operation opSelect = Operation.None;
+class _GameScreenState extends State<GameScreen> {
+  final PuzzleService _service = PuzzleService();
   Settings _settings = Settings();
 
-  void checkFinished(){
-    if(numbers.where((n) => n.$2 == 0).length == numbers.length - 1 && numbers.contains((24, 1))){
-      newGame();
-      ++num_solves;
-    }
-  }
+  Puzzle? _puzzle;
+  bool _loading = true;
+  String? _error;
+  int _loadToken = 0;
 
-  void addHistory(){
-    if(history_point < history.length-1){
-      history.removeRange(history_point + 1, history.length);
-    }
-    history.add((List<(int,int)>.from(numbers), num_select));
-    history_point += 1;
-  }
+  /// Current cards; null once a card has been combined into another.
+  List<Frac?> numbers = [];
+  List<(List<Frac?>, int)> history = [];
+  int historyPoint = 0;
+  int numSelect = -1;
+  Op? opSelect;
 
-  void numberPress(int newSelect) {
-    if (numbers[newSelect].$2 == 0) {
-      return;
-    }
-    if(num_select == newSelect){
-      setState(() {
-        num_select = -1;
-        history[history_point] = (history[history_point].$1, num_select);
-      });
-      return;
-    }
-    if (num_select == -1 || opSelect == Operation.None) {
-      setState(() {
-        num_select = newSelect;
-        history[history_point] = (history[history_point].$1, num_select);
-      });
-      return;
-    }
-    setState(() {
-      (int, int) newNum = numbers[newSelect];
-      (int, int) oldNum = numbers[num_select];
-      if(newNum.$1 == 0 && opSelect == Operation.Division){
-        return;
-      }
+  late Timer timer;
+  int timerSeconds = 0;
+  int puzzleStartSeconds = 0;
+  int numSolves = 0;
+  bool _revealed = false;
 
-      var opMap = {
-        Operation.Addition: addFrac,
-        Operation.Subtraction: subFrac,
-        Operation.Multiplication: mulFrac,
-        Operation.Division: divFrac,
-      };
+  /// Set between solving a puzzle and the next one appearing.
+  bool _advancing = false;
 
-      history[history_point] = (history[history_point].$1, num_select);
-      
-      numbers[newSelect] = opMap[opSelect]!(oldNum, newNum);
-      numbers[num_select] = (0,0);
-      opSelect = Operation.None;
-      num_select = newSelect;
-
-      addHistory();
-
-      checkFinished();
-
-    });
-  }
-
-  void opPress(Operation operation) {
-    setState(() {
-      if (operation == Operation.Reset) {
-        newGame();
-        timer_seconds = 0;
-        num_solves = 0;
-      } else if(operation == opSelect){
-        opSelect = Operation.None;
-        return;
-      } else if(operation == Operation.Undo) {
-        if(history_point <= 0){
-          return;
-        }
-        --history_point;
-        numbers = List<(int,int)>.from(history[history_point].$1);
-        num_select = history[history_point].$2;
-        opSelect = Operation.None;
-      } else if(operation == Operation.Redo){
-        if(history_point >= history.length - 1){
-          return;
-        }
-        ++history_point;
-        numbers = List<(int,int)>.from(history[history_point].$1);
-        num_select = history[history_point].$2;
-        opSelect = Operation.None;
-      } else if(operation == Operation.Sum || operation == Operation.Product) {
-        if(numbers.where((n) => n.$2 == 0).length == numbers.length - 1){
-          return;
-        }
-        (int,int) result = operation == Operation.Sum ? (0,1) : (1,1);
-        for (int i = 0; i < 4; ++i) {
-          if (numbers[i].$2 == 0) {
-            continue;
-          }
-          if (operation == Operation.Sum) {
-            result = addFrac(result, numbers[i]);
-          } else {
-            result = mulFrac(result, numbers[i]);
-          }
-          numbers[i] = (0,0);
-        }
-        if (num_select != -1) {
-          numbers[num_select] = result;
-        } else {
-          numbers[0] = result;
-        }
-        addHistory();
-      } else {
-        opSelect = operation;
-      }
-      checkFinished();
-    });
-
-
-  }
-
-  void newGame() {
-    var rng = Random();
-    int index = rng.nextInt(_settings.maxDifficulty.floor()-_settings.minDifficulty.floor()) + _settings.minDifficulty.floor();
-    List<int> game = games[index].toList()..shuffle(rng);
-    for(int i = 0; i < 4; ++i){
-      numbers[i] = (game[i], 1);
-    }
-    opSelect = Operation.None;
-    num_select = -1;
-    history = [(List<(int,int)>.from(numbers), -1)];
-    history_point = 0;
-  }
-
-  void _openSettingsDialog(BuildContext context) async {
-    final newSettings = await showDialog<Settings>(
-      context: context,
-      builder: (BuildContext context) {
-        return SettingsPage(
-          appSettings: widget.appSettings,
-          onSettingsChanged: _updateSettings,
-          initialSettings: _settings, // Pass the current settings
-        );
-      },
-    );
-
-    if (newSettings != null) {
-      // Update the settings if the dialog was closed with new settings
-      _updateSettings(newSettings);
-    }
-  }
-
-  void _openHelpDialog(BuildContext context) {
-    showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: Text('Instructions'),
-          content: const Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text("""
-Make the number 24 using +, -, ×, ÷ and all four numbers!
-
-For example, if your numbers were [1, 3, 6, 8], a solution would be (6-3)×8×1=24.
-
-Use « and » to undo and redo your last move. ++ adds all remaining numbers, and similarly ×× multiplies everything left.
-
-All the puzzles given are guaranteed to be possible.
-
-The difficulty sliders in settings represent average solve times of all 1362 possible puzzles experimentaly measured at www.4nums.com.
-              """)
-            ]
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
-              child: const Text('Done'),
-            ),
-          ]
-        );
-      },
-    );
-  }
-
-  void _updateSettings(Settings newSettings) {
-    setState(() {
-      _settings = newSettings; // Update the settings
-      widget.changeTheme(_settings.darkMode, _settings.themeColor);
-    });
-  }
+  bool get _useAll => _settings.effectiveUseAll;
 
   @override
-  void initState(){
+  void initState() {
     super.initState();
     _settings = readSettings(widget.appSettings);
     timer = Timer.periodic(const Duration(seconds: 1), (Timer t) {
       setState(() {
-        ++timer_seconds;
+        ++timerSeconds;
       });
     });
-    newGame();
+    _loadNext();
   }
 
   @override
@@ -336,221 +115,646 @@ The difficulty sliders in settings represent average solve times of all 1362 pos
     super.dispose();
   }
 
+  /// Loads the next puzzle. With [showSpinner] false the current board stays up
+  /// until the (usually prefetched) puzzle arrives, so there's no visible gap.
+  Future<void> _loadNext({bool showSpinner = true}) async {
+    final token = ++_loadToken;
+    setState(() {
+      _error = null;
+      if (showSpinner) _loading = true;
+    });
+    try {
+      final puzzle = await _service.next(_settings);
+      if (token != _loadToken || !mounted) return;
+      setState(() {
+        _startPuzzle(puzzle);
+        _loading = false;
+        _advancing = false;
+      });
+      _service.prefetch(_settings);
+    } on NoPuzzleException catch (e) {
+      if (token != _loadToken || !mounted) return;
+      setState(() {
+        _error = e.message;
+        _loading = false;
+        _advancing = false;
+        _puzzle = null;
+      });
+    }
+  }
+
+  void _startPuzzle(Puzzle p) {
+    _puzzle = p;
+    numbers = p.hand.map<Frac?>((c) => Frac(c)).toList();
+    opSelect = null;
+    numSelect = -1;
+    history = [(List<Frac?>.from(numbers), -1)];
+    historyPoint = 0;
+    puzzleStartSeconds = timerSeconds;
+    _revealed = false;
+  }
+
+  bool get _inputEnabled => _puzzle != null && !_loading && !_advancing;
+
+  void checkFinished() {
+    final target = _puzzle!.target;
+    final remaining = numbers.whereType<Frac>().toList();
+    final solved =
+        _useAll ? remaining.length == 1 && remaining.first == target : historyPoint > 0 && remaining.contains(target);
+    if (!solved) return;
+    HapticFeedback.mediumImpact();
+    setState(() {
+      _advancing = true;
+      if (!_revealed) ++numSolves;
+    });
+    _loadNext(showSpinner: false);
+  }
+
+  void addHistory() {
+    if (historyPoint < history.length - 1) {
+      history.removeRange(historyPoint + 1, history.length);
+    }
+    history.add((List<Frac?>.from(numbers), numSelect));
+    historyPoint += 1;
+  }
+
+  void _toast(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message), duration: const Duration(seconds: 2)));
+  }
+
+  void numberPress(int newSelect) {
+    if (!_inputEnabled || numbers[newSelect] == null) {
+      return;
+    }
+    HapticFeedback.selectionClick();
+    if (numSelect == newSelect) {
+      setState(() {
+        numSelect = -1;
+        history[historyPoint] = (history[historyPoint].$1, numSelect);
+      });
+      return;
+    }
+    if (numSelect == -1 || opSelect == null) {
+      setState(() {
+        numSelect = newSelect;
+        history[historyPoint] = (history[historyPoint].$1, numSelect);
+      });
+      return;
+    }
+    final newNum = numbers[newSelect]!;
+    final oldNum = numbers[numSelect]!;
+    if (newNum.isZero && opSelect == Op.div) {
+      _toast("Can't divide by zero");
+      return;
+    }
+    final result = opSelect!.apply(oldNum, newNum);
+    if (result.n.abs() > _maxMagnitude || result.d > _maxMagnitude) {
+      _toast('That number is too large');
+      return;
+    }
+    setState(() {
+      history[historyPoint] = (history[historyPoint].$1, numSelect);
+      numbers[newSelect] = result;
+      numbers[numSelect] = null;
+      opSelect = null;
+      numSelect = newSelect;
+      addHistory();
+    });
+    checkFinished();
+  }
+
+  void opPress(Op op) {
+    if (!_inputEnabled) return;
+    HapticFeedback.selectionClick();
+    setState(() {
+      opSelect = opSelect == op ? null : op;
+    });
+  }
+
+  void undo() {
+    if (!_inputEnabled || historyPoint <= 0) return;
+    setState(() {
+      --historyPoint;
+      numbers = List<Frac?>.from(history[historyPoint].$1);
+      numSelect = history[historyPoint].$2;
+      opSelect = null;
+    });
+  }
+
+  void redo() {
+    if (!_inputEnabled || historyPoint >= history.length - 1) return;
+    setState(() {
+      ++historyPoint;
+      numbers = List<Frac?>.from(history[historyPoint].$1);
+      numSelect = history[historyPoint].$2;
+      opSelect = null;
+    });
+  }
+
+  /// Adds (or multiplies) every remaining card together.
+  void combineAll(Op op) {
+    if (!_inputEnabled) return;
+    final live = [
+      for (var i = 0; i < numbers.length; ++i)
+        if (numbers[i] != null) i
+    ];
+    if (live.length < 2) return;
+    var result = op == Op.add ? Frac.zero : Frac.one;
+    for (final i in live) {
+      result = op.apply(result, numbers[i]!);
+    }
+    if (result.n.abs() > _maxMagnitude || result.d > _maxMagnitude) {
+      _toast('That number is too large');
+      return;
+    }
+    HapticFeedback.selectionClick();
+    setState(() {
+      final dest = numSelect != -1 ? numSelect : live.first;
+      for (final i in live) {
+        numbers[i] = null;
+      }
+      numbers[dest] = result;
+      numSelect = dest;
+      opSelect = null;
+      addHistory();
+    });
+    checkFinished();
+  }
+
+  static final _digitKeys = [
+    LogicalKeyboardKey.digit1,
+    LogicalKeyboardKey.digit2,
+    LogicalKeyboardKey.digit3,
+    LogicalKeyboardKey.digit4,
+    LogicalKeyboardKey.digit5,
+    LogicalKeyboardKey.digit6,
+    LogicalKeyboardKey.digit7,
+    LogicalKeyboardKey.digit8,
+    LogicalKeyboardKey.digit9,
+  ];
+  static final _numpadKeys = [
+    LogicalKeyboardKey.numpad1,
+    LogicalKeyboardKey.numpad2,
+    LogicalKeyboardKey.numpad3,
+    LogicalKeyboardKey.numpad4,
+    LogicalKeyboardKey.numpad5,
+    LogicalKeyboardKey.numpad6,
+    LogicalKeyboardKey.numpad7,
+    LogicalKeyboardKey.numpad8,
+    LogicalKeyboardKey.numpad9,
+  ];
+
+  /// Same hotkeys as www.4nums.com: 1–4 pick cards (numpad keys mirror the card
+  /// grid), Q W E R pick + − × ÷, A adds all, S multiplies all, Esc undoes and
+  /// ` redoes. With more cards, 1–9 pick cards in reading order.
+  KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    final n = numbers.length;
+    final digit = _digitKeys.indexOf(key);
+    if (digit >= 0) {
+      if (digit < n) numberPress(digit);
+      return KeyEventResult.handled;
+    }
+    final pad = _numpadKeys.indexOf(key);
+    if (pad >= 0) {
+      // Numpad rows map bottom-up onto the card grid, like a phone keypad flipped.
+      final cols = n == 4 ? 2 : 3;
+      final rows = (n / cols).ceil();
+      final col = pad % 3, rowFromBottom = pad ~/ 3;
+      final i = (rows - 1 - rowFromBottom) * cols + col;
+      if (col < cols && rowFromBottom < rows && i < n) numberPress(i);
+      return KeyEventResult.handled;
+    }
+    final action = {
+      LogicalKeyboardKey.keyQ: () => opPress(Op.add),
+      LogicalKeyboardKey.keyW: () => opPress(Op.sub),
+      LogicalKeyboardKey.keyE: () => opPress(Op.mul),
+      LogicalKeyboardKey.keyR: () => opPress(Op.div),
+      LogicalKeyboardKey.keyA: () => combineAll(Op.add),
+      LogicalKeyboardKey.keyS: () => combineAll(Op.mul),
+      LogicalKeyboardKey.escape: undo,
+      LogicalKeyboardKey.backquote: redo,
+    }[key];
+    if (action == null) return KeyEventResult.ignored;
+    action();
+    return KeyEventResult.handled;
+  }
+
+  void restartSession() {
+    setState(() {
+      timerSeconds = 0;
+      numSolves = 0;
+    });
+    _loadNext();
+  }
+
+  void _showSolution() {
+    final p = _puzzle;
+    if (p == null) return;
+    setState(() => _revealed = true);
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (context) {
+        final theme = Theme.of(context);
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('One solution', style: theme.textTheme.titleLarge),
+                const SizedBox(height: 4),
+                Text(
+                  'The most straightforward route the solver found. '
+                  'This puzzle won\'t count toward your solves.',
+                  style: theme.textTheme.bodySmall,
+                ),
+                const SizedBox(height: 16),
+                for (final (i, s) in p.solution.indexed)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Text(
+                      '${i + 1}.   ${_fmt(s.a)} ${s.op.symbol} ${_fmt(s.b)} = ${_fmt(s.result)}',
+                      style: theme.textTheme.titleMedium?.copyWith(fontFeatures: const [FontFeature.tabularFigures()]),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  String _fmt(Frac f) => f.toString().replaceAll('-', '−');
+
+  void _openSettings() async {
+    final newSettings = await Navigator.of(context).push<Settings>(
+      MaterialPageRoute(builder: (_) => SettingsPage(initialSettings: _settings)),
+    );
+    if (newSettings == null) return;
+    saveSettings(widget.appSettings, newSettings);
+    final puzzleChanged = newSettings.puzzleKey != _settings.puzzleKey;
+    setState(() => _settings = newSettings);
+    widget.changeTheme(_settings.darkMode, _settings.themeColor);
+    if (puzzleChanged) _loadNext();
+  }
+
+  void _openHelpDialog() {
+    final target = _puzzle?.target ?? _settings.fixedTarget;
+    final cards = _settings.cards;
+    final goal = _useAll
+        ? 'Make the target number using +, −, ×, ÷ and all $cards cards.'
+        : 'Make the target number using +, −, ×, ÷ and any of the $cards cards — you don\'t need them all.';
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('How to play'),
+          content: SingleChildScrollView(
+            child: Text('''
+$goal The current target is ${_fmt(target)}.
+
+Tap a card, an operation, then another card to combine them; the result replaces the second card. For example, with [1, 3, 6, 8] and target 24, a solution is (6 − 3) × 8 × 1 = 24.
+
+« and » undo and redo. ++ adds all remaining cards together and ×× multiplies them.
+
+Stuck? The lightbulb shows a solution, and skip deals a new puzzle. Every puzzle is guaranteed to be solvable.
+${kIsWeb ? '\nKeyboard (same as 4nums.com): 1–4 or the numpad pick cards (1–9 with more cards), Q W E R pick + − × ÷, A adds all, S multiplies all, Esc undoes, ` redoes.\n' : ''}
+In settings you can change the target (including fractions, or a random target at four difficulty levels), the number of cards, and the puzzle difficulty range. For the classic game (24 with four cards) puzzles are ordered by average solve times of all 1362 possible puzzles, measured at www.4nums.com; other games use a difficulty model fitted to that data.'''),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Done'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  String _clock(int s) => '${s ~/ 60}:${(s % 60).toString().padLeft(2, '0')}';
+
   @override
   Widget build(BuildContext context) {
-    final screenSize = MediaQuery.of(context).size;
-    double minWidth = screenSize.width / 2-32;
-    double minHeight = (screenSize.height-128)/ 4;
-    final buttonSize = minWidth < minHeight ? minWidth : minHeight;
-
-    Row buildButtonRow(List<(String, int)> buttonLabels, double buttonSize) {
-      return Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: buttonLabels.asMap().entries.map((entry) {
-          int index = entry.key;
-          var label = entry.value;
-          return Row(
-            children: [
-              Opacity(
-                opacity: numbers[label.$2].$2 == 0 ? 0.0 : 1.0,
-                child: CustomButton(
-                  label.$1,
-                  buttonSize,
-                  num_select == label.$2,
-                  onPressed: (){numberPress(label.$2);},
-                ),
-              ),
-              SizedBox(width: index < buttonLabels.length - 1 ? 16.0 : 0), // Add horizontal spacing between buttons
-            ],
-          );
-        }).toList(),
-      );
-    }
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        backgroundColor: scheme.inversePrimary,
+        title: const Text('Two Dozen'),
         actions: [
-          IconButton(
-            icon: Icon(Icons.question_mark), // Replace with your desired icon
-            onPressed: () {_openHelpDialog(context);}
+          IconButton(icon: const Icon(Icons.help_outline), tooltip: 'How to play', onPressed: _openHelpDialog),
+          IconButton(icon: const Icon(Icons.settings), tooltip: 'Settings', onPressed: _openSettings),
+        ],
+      ),
+      body: Focus(
+        autofocus: true,
+        onKeyEvent: _handleKey,
+        child: SafeArea(
+          child: LayoutBuilder(builder: (context, constraints) {
+            final width = constraints.maxWidth;
+            final opSize = min((width - 32 - 3 * 12) / 4, min(84.0, constraints.maxHeight / 9));
+            return Column(
+              children: [
+                const SizedBox(height: 12),
+                _buildHeader(theme),
+                Expanded(child: _buildBoard(theme)),
+                _buildButtonRow([
+                  for (final op in Op.values)
+                    _GameButton(
+                      size: opSize,
+                      active: opSelect == op,
+                      onPressed: () => opPress(op),
+                      child: Text(op.symbol, style: TextStyle(fontSize: opSize * 0.4)),
+                    ),
+                ]),
+                const SizedBox(height: 12),
+                _buildButtonRow([
+                  _GameButton(
+                    size: opSize,
+                    onPressed: historyPoint > 0 ? undo : null,
+                    child: Text('«', style: TextStyle(fontSize: opSize * 0.4)),
+                  ),
+                  _GameButton(
+                    size: opSize,
+                    onPressed: () => combineAll(Op.add),
+                    child: Text('++', style: TextStyle(fontSize: opSize * 0.32)),
+                  ),
+                  _GameButton(
+                    size: opSize,
+                    onPressed: () => combineAll(Op.mul),
+                    child: Text('××', style: TextStyle(fontSize: opSize * 0.32)),
+                  ),
+                  _GameButton(
+                    size: opSize,
+                    onPressed: historyPoint < history.length - 1 ? redo : null,
+                    child: Text('»', style: TextStyle(fontSize: opSize * 0.4)),
+                  ),
+                ]),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    TextButton.icon(
+                      onPressed: restartSession,
+                      icon: const Icon(Icons.restart_alt),
+                      label: const Text('Restart'),
+                    ),
+                    TextButton.icon(
+                      onPressed: _inputEnabled ? _showSolution : null,
+                      icon: const Icon(Icons.lightbulb_outline),
+                      label: const Text('Solution'),
+                    ),
+                    TextButton.icon(
+                      onPressed: _inputEnabled || _error != null ? () => _loadNext() : null,
+                      icon: const Icon(Icons.skip_next),
+                      label: const Text('Skip'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+              ],
+            );
+          }),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHeader(ThemeData theme) {
+    final scheme = theme.colorScheme;
+    final statStyle = theme.textTheme.headlineMedium?.copyWith(fontFeatures: const [FontFeature.tabularFigures()]);
+    final target = _puzzle?.target;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      child: Row(
+        children: [
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: _settings.timerEnabled
+                  ? Row(mainAxisSize: MainAxisSize.min, children: [
+                      const Icon(Icons.timer_outlined),
+                      const SizedBox(width: 6),
+                      Text(_clock(timerSeconds), style: statStyle),
+                    ])
+                  : const SizedBox.shrink(),
+            ),
           ),
-          IconButton(
-            icon: Icon(Icons.settings), // Replace with your desired icon
-            onPressed: () {_openSettingsDialog(context);}
+          Container(
+            constraints: const BoxConstraints(minWidth: 96),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            decoration: BoxDecoration(
+              color: scheme.primaryContainer,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('TARGET',
+                    style: theme.textTheme.labelSmall?.copyWith(color: scheme.onPrimaryContainer, letterSpacing: 1.5)),
+                SizedBox(
+                  height: 48,
+                  child: target == null
+                      ? const SizedBox.shrink()
+                      : FittedBox(
+                          child:
+                              FracText(target, fontSize: 40, color: scheme.onPrimaryContainer, weight: FontWeight.bold),
+                        ),
+                ),
+                _DifficultyDots(_puzzle?.percentile, color: scheme.onPrimaryContainer),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                const Icon(Icons.emoji_events_outlined),
+                const SizedBox(width: 6),
+                Text('$numSolves', style: statStyle),
+              ]),
+            ),
           ),
         ],
       ),
-      body: Align(
-        alignment: Alignment.topCenter,
-        child: 
-         Column(
-          // mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const SizedBox(height: 16.0),
-            Row(
-              children:[
-                const SizedBox(width: 24.0),
-                ...(_settings.timerEnabled ? [
-                  const Icon(Icons.timer),
-                  const SizedBox(width: 8.0),
-                  Text(
-                    _settings.timerEnabled ? '$timer_seconds' : '',
-                    style: const TextStyle(fontSize:36),
-                  ),
-                ] : []),
-                const Spacer(),
-                const Icon(Icons.emoji_events),
-                const SizedBox(width: 8.0),
-                Text(
-                  '$num_solves',
-                  style: const TextStyle(fontSize:36),
-                ),
-                const SizedBox(width: 24.0),
-              ]
-            ),
-            const SizedBox(height: 12.0),
-            Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: <Widget>[
-                buildButtonRow([(strFrac(numbers[0]), 0), (strFrac(numbers[1]), 1)], buttonSize),
-                const SizedBox(height: 16.0), // Add horizontal spacing between buttons
-                buildButtonRow([(strFrac(numbers[2]), 2), (strFrac(numbers[3]), 3)], buttonSize),
-                const SizedBox(height: 16.0), // Add horizontal spacing between buttons
-              ],
-            ),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: <Widget>[
-                ButtonGroup(
-                  const [('+', Operation.Addition), ('-', Operation.Subtraction), ('×', Operation.Multiplication), ('÷', Operation.Division)],
-                  min(screenSize.width / 4-16, buttonSize*0.75),
-                  8,
-                  opPress,
-                  opSelect
-                ),
-              ],
-            ),
-            const SizedBox(height: 16.0), // Add vertical margin
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: <Widget>[
-                ButtonGroup(
-                  const [('«', Operation.Undo), ('++', Operation.Sum), ('××', Operation.Product), ('»', Operation.Redo)],
-                  min(screenSize.width / 4-16, buttonSize*0.75),
-                  8,
-                  opPress,
-                  Operation.None
-                ),
-              ],
-            ),
-          ],
-        )
-      ),
-      floatingActionButton:
-        FloatingActionButton(
-          onPressed: (){opPress(Operation.Reset);},
-          tooltip: 'Increment',
-          child: const Icon(Icons.restart_alt),
-        ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
-}
 
-class CustomButton extends StatefulWidget {
-  final String label;
-  final double size;
-  final bool isActive; // Added isActive property
-  final VoidCallback? onPressed;
-
-  CustomButton(
-    this.label,
-    this.size,
-    this.isActive,
-    {this.onPressed}
-  );
-
-  @override
-  _CustomButtonState createState() => _CustomButtonState();
-}
-
-class _CustomButtonState extends State<CustomButton> {
-  @override
-  Widget build(BuildContext context) {
-
-    return Container(
-      width: widget.size,
-      height: widget.size,
-      child: widget.isActive ? FilledButton(
-        onPressed: widget.onPressed,
-        style: ElevatedButton.styleFrom(
-          padding: const EdgeInsets.all(0),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(0),
-          ),
-        ),
-        child: Center(
-          child: Text(
-            widget.label,
-            style: const TextStyle(
-              fontSize: 24.0,
-            ),
-          ),
-        ),
-      ) : FilledButton.tonal( 
-        onPressed: widget.onPressed,
-        style: ElevatedButton.styleFrom(
-          padding: const EdgeInsets.all(0),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(0),
-          ),
-        ),
-        child: Center(
-          child: Text(
-            widget.label,
-            style: const TextStyle(
-              fontSize: 24.0,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class ButtonGroup extends StatelessWidget {
-  final List<(String, Operation)> labels;
-  final double size;
-  final double spacing; // Define spacing between buttons
-  final void Function(Operation) onPressed;
-  final Operation active;
-
-  ButtonGroup(this.labels, this.size, this.spacing, this.onPressed, this.active);
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: size * labels.length.toDouble() + spacing * (labels.length - 1),
-      height: size,
-      child: Row(
-        children: labels.asMap().entries.map((entry) {
-          final index = entry.key;
-          final operation = entry.value.$2;
-          return Row(
-            children: <Widget>[
-              CustomButton(
-                entry.value.$1,
-                size,
-                active == operation,
-                onPressed: () {
-                  onPressed(operation);
-                },
-              ),
-              if (index != labels.length - 1) SizedBox(width: spacing),
+  Widget _buildBoard(ThemeData theme) {
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(_error!, textAlign: TextAlign.center, style: theme.textTheme.titleMedium),
+              const SizedBox(height: 16),
+              FilledButton.tonal(onPressed: _openSettings, child: const Text('Open settings')),
             ],
-          );
-        }).toList(),
-      ),
+          ),
+        ),
+      );
+    }
+    if (_puzzle == null || _loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    return LayoutBuilder(builder: (context, constraints) {
+      final n = numbers.length;
+      final cols = n == 4 ? 2 : 3;
+      final rows = (n / cols).ceil();
+      const gap = 16.0;
+      final size = [
+        (constraints.maxWidth - 48 - (cols - 1) * gap) / cols,
+        (constraints.maxHeight - 32 - (rows - 1) * gap) / rows,
+        200.0,
+      ].reduce(min);
+      return Center(
+        child: SizedBox(
+          width: cols * size + (cols - 1) * gap,
+          child: Wrap(
+            alignment: WrapAlignment.center,
+            spacing: gap,
+            runSpacing: gap,
+            children: [
+              for (var i = 0; i < n; ++i)
+                Opacity(
+                  opacity: numbers[i] == null ? 0.0 : 1.0,
+                  child: IgnorePointer(
+                    ignoring: numbers[i] == null,
+                    child: _GameButton(
+                      size: size,
+                      active: numSelect == i,
+                      onPressed: () => numberPress(i),
+                      child: numbers[i] == null
+                          ? const SizedBox.shrink()
+                          : Padding(
+                              padding: EdgeInsets.all(size * 0.12),
+                              child: FittedBox(child: FracText(numbers[i]!, fontSize: size * 0.36)),
+                            ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      );
+    });
+  }
+
+  Widget _buildButtonRow(List<Widget> buttons) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        for (final (i, b) in buttons.indexed) ...[
+          if (i > 0) const SizedBox(width: 12),
+          b,
+        ],
+      ],
     );
   }
 }
 
+/// Square button used for cards and operations; filled when [active].
+class _GameButton extends StatelessWidget {
+  final double size;
+  final bool active;
+  final VoidCallback? onPressed;
+  final Widget child;
+
+  const _GameButton({
+    required this.size,
+    required this.child,
+    this.onPressed,
+    this.active = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final style = ElevatedButton.styleFrom(
+      padding: EdgeInsets.zero,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+    );
+    return SizedBox(
+      width: size,
+      height: size,
+      child: active
+          ? FilledButton(onPressed: onPressed, style: style, child: Center(child: child))
+          : FilledButton.tonal(onPressed: onPressed, style: style, child: Center(child: child)),
+    );
+  }
+}
+
+/// Renders a number, drawing fractions stacked with a bar.
+class FracText extends StatelessWidget {
+  final Frac value;
+  final double fontSize;
+  final Color? color;
+  final FontWeight? weight;
+
+  const FracText(this.value, {super.key, required this.fontSize, this.color, this.weight});
+
+  @override
+  Widget build(BuildContext context) {
+    final style = TextStyle(fontSize: fontSize, color: color, fontWeight: weight, height: 1.1);
+    final sign = value.isNegative ? '−' : '';
+    if (value.isInteger) return Text('$sign${value.n.abs()}', style: style);
+    final small = style.copyWith(fontSize: fontSize * 0.62);
+    final barColor = color ?? DefaultTextStyle.of(context).style.color ?? Theme.of(context).colorScheme.onSurface;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (sign.isNotEmpty) Text(sign, style: style),
+        IntrinsicWidth(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text('${value.n.abs()}', style: small, textAlign: TextAlign.center),
+              Container(height: max(1.5, fontSize * 0.06), color: barColor),
+              Text('${value.d}', style: small, textAlign: TextAlign.center),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Five dots showing where the current puzzle sits in the difficulty ranking.
+class _DifficultyDots extends StatelessWidget {
+  final double? percentile;
+  final Color color;
+  const _DifficultyDots(this.percentile, {required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    final filled = percentile == null ? 0 : (percentile! * 5).floor().clamp(0, 4) + 1;
+    return Tooltip(
+      message: 'Puzzle difficulty',
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (var i = 0; i < 5; ++i)
+            Container(
+              width: 6,
+              height: 6,
+              margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: i < filled ? color : color.withValues(alpha: 0.25),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
